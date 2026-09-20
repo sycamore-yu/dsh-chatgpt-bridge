@@ -62,6 +62,7 @@
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('lib', { recursive: true, force: true })\"",
     "dogfood": "node scripts/dogfood.mjs",
     "dogfood:goal": "node scripts/goal-control-dogfood.mjs",
+    "dogfood:direct": "node scripts/direct-workspace-dogfood.mjs",
     "resume-test": "node scripts/resume-test.mjs",
     "demo-flow": "node scripts/demo-flow.mjs"
   },

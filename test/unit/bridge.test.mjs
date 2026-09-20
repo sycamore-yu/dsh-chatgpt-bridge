@@ -524,14 +524,17 @@ function settle(agent) {
   agent.inbox.nextTurn = [];
 }
 
-test('MCP surface exposes 23 dsh_* tools (v0.5.0 Control Plane Reliability)', async () => {
+test('MCP surface exposes 31 dsh_* tools (v0.6.0 direct workspace channel)', async () => {
   const src = await import('node:fs');
   const text = src.readFileSync(new URL('../../src/mcp.ts', import.meta.url), 'utf8');
   const count = [...text.matchAll(/server\.registerTool\(/g)].length;
-  assert.equal(count, 23);
+  assert.equal(count, 31);
   assert.match(text, /dsh_update_goal/);
   assert.match(text, /dsh_create_goal/);
   assert.match(text, /dsh_revise_goal/);
+  assert.match(text, /dsh_read_file/);
+  assert.match(text, /dsh_write_file/);
+  assert.match(text, /dsh_apply_patch/);
 });
 
 test('Test A — waitGoal/terminal reconciles pending push todo after git push succeeds', async () => {
@@ -777,6 +780,46 @@ test('Test 3 — minimal mode records scan-forbidding constraints', async () => 
   assert.equal(waited.status, 'completed');
   assert.equal(waited.goal.mode, 'minimal');
   assert.equal((waited.progress?.changed_files ?? waited.result?.changed_files ?? []).length, 0);
+});
+
+test('Test 3b — negated read-only Goal wording starts instead of GOAL_INVALID', async () => {
+  const { bridge } = makeStatefulBridge();
+  const started = await bridge.startGoal({
+    workspace: 'ws-1',
+    goal: '只等待 35 秒。禁止扫描 workspace。禁止修改文件。不要创建报告。',
+    execution_mode: 'minimal',
+    constraints: { allow_workspace_scan: false, max_changed_files: 0, read_only: true },
+  });
+  assert.match(started.session_id, /^session-/);
+  assert.equal(started.goal.revision, 1);
+  assert.equal(started.goal.mode, 'minimal');
+});
+
+test('Test 3c — discussed/quoted write wording starts instead of GOAL_INVALID', async () => {
+  const { bridge } = makeStatefulBridge();
+  const started = await bridge.startGoal({
+    workspace: 'ws-1',
+    goal: 'Explain how the delete and publish code paths work; the docs say "write failed".',
+    plan: '1. describe npm publish\n2. quote "create a GitHub Release"\n3. do not run either',
+    constraints: { read_only: true },
+  });
+  assert.match(started.session_id, /^session-/);
+  assert.equal(started.goal.revision, 1);
+});
+
+test('Test 3d — a contradictory structured constraint set still fails preflight', async () => {
+  const { bridge } = makeStatefulBridge();
+  await assert.rejects(
+    () => bridge.startGoal({
+      workspace: 'ws-1',
+      goal: 'Audit only',
+      constraints: { allowed_actions: ['filesystem.read'], forbidden_actions: ['filesystem.read'] },
+    }),
+    (error) => {
+      assert.equal(error.code, 'GOAL_INVALID');
+      return true;
+    },
+  );
 });
 
 test('Test 10 — resume message names completed destructive actions', async () => {

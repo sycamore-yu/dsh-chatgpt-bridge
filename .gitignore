@@ -8,6 +8,9 @@ tools/
 .preview-settings.html
 .preview-*.png
 
+# local scratch / live-verification artifacts (never part of the published package)
+/tmp/
+
 # control-plane unit-test temp dirs
 /.ctrl-*/
 /.test-tmp/

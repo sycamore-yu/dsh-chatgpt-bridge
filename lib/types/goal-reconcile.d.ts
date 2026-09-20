@@ -19,7 +19,9 @@ export interface ReconcileInput {
 }
 /**
  * Map a todo line onto at most one action kind using an explicit lexicon.
- * Unmatched lines stay untouched later.
+ * Unmatched lines stay untouched later. The lexicon deliberately refuses
+ * negation, discussion and quoted-reference wording, because this label feeds
+ * the blocked / deferred / completed reporting paths.
  */
 export declare function classifyTodoKind(content: string): ActionKind | undefined;
 /**

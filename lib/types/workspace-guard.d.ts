@@ -20,6 +20,15 @@ export interface MutationRecord {
     details?: string;
     timestamp: number;
 }
+export interface BaselineCaptureOptions {
+    /**
+     * Workspace-relative paths this caller owns. Changes to exactly these paths
+     * are removed from the fingerprint, so a direct write can prove that nothing
+     * else changed while it was in flight. Exclusion is exact-path only; a
+     * directory prefix must be listed explicitly.
+     */
+    excludePaths?: string[];
+}
 export declare class WorkspaceConcurrencyGuard {
     private readonly locks;
     private readonly sessionLocks;
@@ -40,7 +49,7 @@ export declare class WorkspaceConcurrencyGuard {
     recordMutation(workspacePath: string, record: Omit<MutationRecord, 'timestamp'>): void;
     getLastMutation(workspacePath: string): MutationRecord | undefined;
     /** Capture baseline git HEAD SHA and dirty file status at Goal start. */
-    captureBaseline(workspacePath: string): Promise<WorkspaceBaseline>;
+    captureBaseline(workspacePath: string, options?: BaselineCaptureOptions): Promise<WorkspaceBaseline>;
     /** Detect workspace state drift since baseline. */
     detectDrift(workspacePath: string, baseline: WorkspaceBaseline, currentSessionId: string, currentSnapshot?: WorkspaceBaseline): Promise<{
         drifted: boolean;

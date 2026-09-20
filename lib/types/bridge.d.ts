@@ -16,10 +16,11 @@ import { type BridgeStatus } from './status.js';
 import { type MessageRow, type ToolCallInfo } from './session-view.js';
 import { type ExecutionSupervisionView, type GoalStartResult, type GoalWaitResult } from './goal.js';
 import { type BlockedInfo } from './goal-graph.js';
-import { type GoalHistoryEvent, type GoalSupervisionView } from './goal-control.js';
+import { type AgentOptionsInput, type GoalHistoryEvent, type GoalSupervisionView } from './goal-control.js';
 import { type ExecutionMode, type GoalConstraints } from './goal-constraints.js';
 import { type UserApprovalPolicy } from './approval-policy.js';
 import { WorkspaceConcurrencyGuard } from './workspace-guard.js';
+import { DirectWorkspaceService } from './direct-workspace.js';
 import { ExecutionIdempotencyManager } from './execution-idempotency.js';
 import { type ResultSchema, type CredentialStatus } from './result-schema.js';
 export { normalizePath } from './paths.js';
@@ -206,6 +207,11 @@ export declare class Bridge {
     private muxAbort;
     private webOwnsApprovals;
     readonly workspaceGuard: WorkspaceConcurrencyGuard;
+    /**
+     * v0.6.0 dual channel: the Bridge's own read/search/git/write tools over the
+     * same registry and the same guard as the Goal channel.
+     */
+    readonly directWorkspace: DirectWorkspaceService;
     readonly idempotencyManager: ExecutionIdempotencyManager;
     private readonly workspaceBaselines;
     private readonly recordedMutationCalls;
@@ -239,7 +245,7 @@ export declare class Bridge {
      */
     resolveWorkspace(input: string): Promise<Workspace>;
     health(): Promise<HealthReport>;
-    createSession(workspaceInput: string, title?: string, initialMessage?: string): Promise<SessionView>;
+    createSession(workspaceInput: string, title?: string, initialMessage?: string, agentOptions?: AgentOptionsInput): Promise<SessionView>;
     sendMessage(sessionId: string, message: string): Promise<{
         session_id: string;
         accepted: boolean;
@@ -296,6 +302,7 @@ export declare class Bridge {
         constraints?: GoalConstraints;
         request_id?: string;
         workspace_lock_override?: boolean;
+        agent_options?: AgentOptionsInput;
     }): Promise<GoalStartResult>;
     reviseGoal(input: {
         session_id: string;
@@ -330,6 +337,7 @@ export declare class Bridge {
         constraints?: GoalConstraints;
         expected_revision?: number;
         workspace_lock_override?: boolean;
+        agent_options?: AgentOptionsInput;
     }): Promise<GoalStartResult>;
     updateGoal(input: {
         session_id: string;
@@ -384,11 +392,27 @@ export declare class Bridge {
         layer: ApprovalLayer;
         fail_closed?: boolean;
     }>;
+    /**
+     * A lock holder is active when its agent is live and working. The direct
+     * (non-Goal) write channel publishes its own transient holder in the same
+     * guard, so a Goal starting mid-write must treat it as active too.
+     */
     private isLockHolderActive;
     private workspaceLockedError;
     private assertMutableWorkspaceAvailable;
     private takeWorkspaceLock;
+    /** Idempotent: releasing a lock the session no longer holds is a no-op. */
+    private releaseWorkspaceLock;
     private releaseWorkspaceIfTerminal;
+    /** A supervised Goal that reached a terminal bridge event is never revived. */
+    private isSupervisedGoalEnded;
+    /**
+     * Bridge/DSH reload recovery. A persisted supervised Goal whose live agent is
+     * gone folds from the session log plus the Goal sidecar; when the Goal is not
+     * bridge-terminal the agent is resumed through ensureAgent so the reported
+     * status is the live, stable one instead of a cold 'unknown'.
+     */
+    private recoverPersistedGoal;
     private skipIdempotentStep;
     private recordObservedExecutions;
     private recordObservedExecutionFacts;

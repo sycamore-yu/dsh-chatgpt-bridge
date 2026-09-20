@@ -1,5 +1,110 @@
 # Changelog
 
+## Unreleased — dual channel (Goal + direct workspace tools)
+
+### Added
+
+The bridge now exposes files, search and read-only git directly, without starting
+a DSH Goal, while the existing Goal channel is unchanged.
+
+- **New tools** (8): `dsh_workspace_info`, `dsh_list_directory`, `dsh_read_file`,
+  `dsh_search_workspace`, `dsh_git_status`, `dsh_git_diff`, `dsh_write_file`,
+  `dsh_apply_patch` — 31 `dsh_*` tools in total.
+- **`src/sensitive-paths.ts`**: one pure sensitive-path predicate (dotenv,
+  `*.pem`/`*.key`/keystores, `id_rsa`-style keys, credential/secret/token files,
+  `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.config/gh|gcloud|git`,
+  `secrets/`, `.dsh`, `.git`) applied to reads, listings, searches and writes.
+- **`src/direct-workspace.ts`**: the direct service. Lexical + `realpath`
+  containment, bounded reads/listings/searches/diffs, binary and UTF-8
+  validation, ripgrep with a bounded node fallback, read-only git
+  (`GIT_OPTIONAL_LOCKS=0`, `--no-ext-diff --no-textconv`), atomic writes
+  (temporary file + rename with the existing mode preserved), and exact-match
+  patching that refuses 0 or several matches.
+- **`WorkspaceConcurrencyGuard.captureBaseline(path, { excludePaths })`**: an
+  additive option that fingerprints a workspace while ignoring the paths one
+  operation owns, so a direct write can prove nothing else changed.
+- **Lock and drift integration**: a direct write refuses with `WORKSPACE_LOCKED`
+  while a live Goal holds the workspace mutable lock, publishes a transient
+  holder in the same guard (so a Goal starting mid-write is refused too), and
+  fails closed with `WORKSPACE_DRIFT` — rolling the file back — when the rest of
+  the workspace changed while the write was in flight.
+- **Stable error codes**: `WORKSPACE_NOT_FOUND`, `PATH_OUTSIDE_WORKSPACE`,
+  `SENSITIVE_PATH_DENIED`, `BINARY_FILE_DENIED`, `FILE_EXISTS`, `FILE_TOO_LARGE`,
+  `SYMLINK_NOT_WRITABLE`, `PRECONDITION_FAILED`, `PATCH_CONFLICT`,
+  `PATCH_INVALID`, `WORKSPACE_LOCKED`, `WORKSPACE_DRIFT`, `GIT_NOT_A_REPOSITORY`,
+  `GIT_UNAVAILABLE`, `INVALID_ARGUMENT`, and others.
+- **Tests**: `test/unit/direct-workspace.test.mjs` (33 cases) and
+  `test/unit/direct-workspace-mcp.test.mjs` (7 protocol-level cases) cover normal
+  read/list/search/git, `../` traversal, symlink escape, sensitive paths, binary
+  files, paging and size bounds, patch success/0-match/multi-match, lock
+  conflicts, drift rollback, atomic write and mode preservation, the read-only
+  "no mutable lock" invariant, both search engines, tool schemas and the MCP
+  error convention.
+
+### Notes
+
+- The direct channel never runs commands, never stages/commits/pushes, and makes
+  every permission decision from structured state only (registered workspace,
+  resolved path, policy, live lock state, observed file/git state) — never from
+  Goal free text.
+- `dsh_read_file` and `dsh_search_workspace` still pass through the bridge-wide
+  secret redaction; both report `redacted: true` when the returned text was
+  masked, while `sha256` always describes the on-disk bytes.
+
+## Unreleased
+
+Control-plane correction: free text is never treated as action intent.
+
+### Changed
+
+- **Goal preflight validates structured constraints only**: `validateGoalPreflight`
+  no longer scans the `goal` / `plan` strings for write / git / publish / network
+  keywords. A legitimate read-only Goal whose wording merely *mentions* an
+  action — negated ("do not modify any file"), discussed ("audit the code that
+  handles deletes"), quoted ('the error says "write failed"'), or written in
+  Chinese ("禁止修改文件") — starts normally instead of failing with
+  `GOAL_INVALID`. The previously shipped keyword lists also missed negation and
+  quotation entirely and matched Chinese substrings such as `修改` / `创建`
+  inside prohibitions.
+  - `GOAL_INVALID` is still returned for contradictory **structured** constraints:
+    an action class in both `allowed_actions` and `forbidden_actions`,
+    `read_only=true` together with an explicit `filesystem.write` grant, or
+    `allow_workspace_scan=false` together with an explicit `filesystem.scan`
+    grant.
+- **Step deferral is structured**: `detectDeferredKinds(plan?)` no longer scans
+  prose for `defer ... npm publish` / `defer ... push` wording. It reads only
+  the explicit `[deferred]` Plan marker; explicit `defer_steps` refs keep
+  working as before. A resume message such as "Resume the deferred npm step",
+  a discussion such as "we discussed whether to defer npm publish", or a
+  prohibition such as "do not defer npm publish" can no longer silently withhold
+  a step or contradict an explicit resume.
+- **`classifyTodoKind` refuses negation, discussion and quoted references**
+  (English + Chinese) before labeling a todo or Plan line. The label feeds the
+  completed / deferred / blocked reporting paths, so a keyword that only appears
+  inside "Do not push yet", "The docs describe how git push works" or
+  `"git push failed"` no longer promotes, defers or blocks a step.
+
+### Preserved
+
+- Execution-time structured boundaries are unchanged: `read_only`,
+  `allowed_actions` / `forbidden_actions`, `max_changed_files`, the workspace
+  mutable lock, and the L0–L3 approval policy all still fail closed on real
+  tool calls.
+
+## 0.5.2 — 2026-09-19
+
+Model and Reasoning Effort Control: allows ChatGPT to explicitly specify provider, model, and reasoning intensity when creating sessions or supervised goals.
+
+### Added
+
+- **Model and Reasoning Effort Control (`agent_options`)**:
+  - Added optional `agent_options` (`provider: string`, `model: string`, `reasoning_effort?: string`) to `dsh_create_session`, `dsh_create_goal`, and `dsh_start_goal`.
+  - Configures both DSH `AgentOptions` and initial `installModelSelection` so that global profile defaults cannot overwrite explicit choices and `reasoningEffort` correctly propagates into runtime requests and durable session headers.
+  - Idempotency fingerprint in `start_goal` incorporates `agent_options`; conflicting options with the same `request_id` are rejected with `REQUEST_ID_CONFLICT`.
+  - Active goal session reuse strictly respects `agent_options`: active goals created under different or default models will not be mistakenly reused when explicit options are specified.
+  - Rejects attempts to supply `session_id` and `agent_options` simultaneously with `AGENT_OPTIONS_NOT_SUPPORTED_FOR_EXISTING_SESSION`, enforcing that explicit model options apply strictly to new sessions.
+  - Full backward compatibility for legacy calls omitting `agent_options`.
+
 ## 0.5.1 — 2026-08-28
 
 Security and provenance patch for the v0.5 control plane, addressing all six

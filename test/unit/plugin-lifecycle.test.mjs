@@ -10,6 +10,7 @@ import { startHttpServer } from '../../lib/http.js';
 
 const EXPECTED_TOOLS = [
   'dsh_answer_question',
+  'dsh_apply_patch',
   'dsh_approve',
   'dsh_cancel_task',
   'dsh_create_goal',
@@ -18,20 +19,27 @@ const EXPECTED_TOOLS = [
   'dsh_get_result',
   'dsh_get_session',
   'dsh_get_task_status',
+  'dsh_git_diff',
+  'dsh_git_status',
   'dsh_health',
+  'dsh_list_directory',
   'dsh_list_sessions',
   'dsh_list_workspaces',
   'dsh_pause_goal',
+  'dsh_read_file',
   'dsh_rerun_step',
   'dsh_resume_goal',
   'dsh_retry_step',
   'dsh_revise_goal',
+  'dsh_search_workspace',
   'dsh_send_message',
   'dsh_start_goal',
   'dsh_stop_goal',
   'dsh_update_goal',
   'dsh_wait_goal',
   'dsh_wait_until_action_required',
+  'dsh_workspace_info',
+  'dsh_write_file',
 ];
 
 function freePort() {
@@ -121,7 +129,7 @@ test('shipped plugin entry exports name, apply, and Config', async () => {
   assert.ok(Config);
 });
 
-test('createMcpServer registers all public dsh_* tools (v0.5.0)', () => {
+test('createMcpServer registers all public dsh_* tools (v0.6.0)', () => {
   const server = createMcpServer(
     {},
     { resultMaxChars: 100, resultMaxItems: 10, sessionMaxItems: 5, sessionMaxChars: 100 },
@@ -129,7 +137,7 @@ test('createMcpServer registers all public dsh_* tools (v0.5.0)', () => {
   );
   const names = Object.keys(server._registeredTools).sort();
   assert.deepEqual(names, [...EXPECTED_TOOLS].sort());
-  assert.equal(names.length, 23);
+  assert.equal(names.length, 31);
 });
 
 test('package clean script is ESM-safe under type:module', () => {

@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent, AgentOptions, ModelSelection } from '@deepseek-ai/dsh-agent';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { createUserMessage, type ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import {
   SessionId,
   SessionLogOffset,
@@ -97,7 +97,9 @@ import {
   sliceHistory,
   supervisionGoal,
   isGoalSemanticallyEqual,
+  isAgentOptionsEqual,
   pruneBlockers,
+  type AgentOptionsInput,
   type GoalHistoryEvent,
   type GoalRecord,
   type GoalSupervisionView,
@@ -114,6 +116,7 @@ import {
 import { validateGoalPreflight } from './goal-preflight.js';
 import { evaluateApproval, DEFAULT_APPROVAL_POLICY, type UserApprovalPolicy } from './approval-policy.js';
 import { WorkspaceConcurrencyGuard, type WorkspaceBaseline } from './workspace-guard.js';
+import { DirectWorkspaceService } from './direct-workspace.js';
 import { ExecutionIdempotencyManager, idempotencyKindFor, isVerifiedKind } from './execution-idempotency.js';
 import { buildResultSchema, inspectCredentials, type ResultSchema, type CredentialStatus } from './result-schema.js';
 import { isPathInsideWorkspace } from './paths.js';
@@ -349,6 +352,11 @@ export class Bridge {
   private webOwnsApprovals = false;
 
   readonly workspaceGuard = new WorkspaceConcurrencyGuard();
+  /**
+   * v0.6.0 dual channel: the Bridge's own read/search/git/write tools over the
+   * same registry and the same guard as the Goal channel.
+   */
+  readonly directWorkspace: DirectWorkspaceService;
   readonly idempotencyManager = new ExecutionIdempotencyManager();
   private readonly workspaceBaselines = new Map<string, WorkspaceBaseline>();
   private readonly recordedMutationCalls = new Set<string>();
@@ -373,6 +381,11 @@ export class Bridge {
     this.goalStore = new GoalControlStore(
       home === undefined ? undefined : fileStoreIo(goalControlDir(home)),
     );
+    this.directWorkspace = new DirectWorkspaceService({
+      resolveWorkspace: (input) => this.resolveWorkspace(input),
+      guard: this.workspaceGuard,
+      isLockHolderActive: (sessionId) => this.isLockHolderActive(sessionId),
+    });
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -486,7 +499,14 @@ export class Bridge {
 
   // ── model selection + composition (mirrors the web api-proxy) ─────────────
 
-  private agentOptions(): AgentOptions {
+  private agentOptions(explicit?: AgentOptionsInput): AgentOptions {
+    if (explicit !== undefined) {
+      return {
+        provider: explicit.provider,
+        model: explicit.model,
+        ...(explicit.reasoning_effort !== undefined ? { reasoningEffort: explicit.reasoning_effort as ReasoningEffortId } : {}),
+      };
+    }
     const defaults = this.ctx.get('agentDefaultModel');
     if (defaults !== undefined) {
       const selection = defaults.currentSelection();
@@ -496,9 +516,15 @@ export class Bridge {
   }
 
   /** Agent-scoped model selection with log-derived fallback for resumes. */
-  private installSelection(agentCtx: Context, agent: Agent): void {
+  private installSelection(agentCtx: Context, agent: Agent, explicit?: AgentOptionsInput): void {
     const defaults = this.ctx.get('agentDefaultModel');
-    let picked: ModelSelection | undefined;
+    let picked: ModelSelection | undefined = explicit !== undefined
+      ? {
+          provider: explicit.provider,
+          model: explicit.model,
+          ...(explicit.reasoning_effort !== undefined ? { reasoningEffort: explicit.reasoning_effort as ReasoningEffortId } : {}),
+        }
+      : undefined;
     const selection: { current: ModelSelection; assembled: ModelSelection | undefined } = {
       get current() {
         if (picked !== undefined) return picked;
@@ -522,7 +548,7 @@ export class Bridge {
   }
 
   /** Compose the preset+selection setup used at agent creation/resume. */
-  private async composeSetupFor(presetId: string | undefined): Promise<{
+  private async composeSetupFor(presetId: string | undefined, explicit?: AgentOptionsInput): Promise<{
     agentPreset?: string;
     setup: (agentCtx: Context, agent: Agent) => Promise<void> | void;
   }> {
@@ -530,7 +556,7 @@ export class Bridge {
     if (presets === undefined) {
       return {
         setup: (agentCtx, agent) => {
-          this.installSelection(agentCtx, agent);
+          this.installSelection(agentCtx, agent, explicit);
         },
       };
     }
@@ -538,7 +564,7 @@ export class Bridge {
     return {
       agentPreset: resolvedId,
       setup: async (agentCtx, agent) => {
-        this.installSelection(agentCtx, agent);
+        this.installSelection(agentCtx, agent, explicit);
         await presets.mount(agentCtx, resolvedId);
       },
     };
@@ -679,15 +705,16 @@ export class Bridge {
     workspaceInput: string,
     title?: string,
     initialMessage?: string,
+    agentOptions?: AgentOptionsInput,
   ): Promise<SessionView> {
     const workspace = await this.resolveWorkspace(workspaceInput);
     const sessionId = `session-${randomUUID()}`;
-    const composition = await this.composeSetupFor(undefined);
+    const composition = await this.composeSetupFor(undefined, agentOptions);
     let agent: Agent;
     try {
       const handle = await this.ctx.agents.create({
         sessionId: SessionId(sessionId),
-        agentOptions: this.agentOptions(),
+        agentOptions: this.agentOptions(agentOptions),
         meta: {
           cwd: workspace.path,
           ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
@@ -744,6 +771,10 @@ export class Bridge {
       throw new BridgeError('SESSION_NOT_LIVE', `session ${sessionId} is not loaded; only live sessions can be cancelled`);
     }
     agent.cancel({ kind: 'user' });
+    // Cancelling the active turn ends this session's claim on the workspace
+    // immediately. Release here instead of waiting for a later status poll to
+    // observe a terminal turn.
+    this.releaseWorkspaceLock(sessionId);
     return { session_id: sessionId, cancelled: true };
   }
 
@@ -840,14 +871,14 @@ export class Bridge {
   }
 
   async getSession(sessionId: string, maxItems?: number, maxChars?: number): Promise<SessionView> {
-    const view = await this.loadView(sessionId);
+    const loaded = await this.loadView(sessionId);
+    const { view, status } = await this.recoverPersistedGoal(sessionId, loaded);
     const items = maxItems ?? this.cfg.sessionMaxItems;
     const chars = maxChars ?? this.cfg.sessionMaxChars;
     const pending = view.agent !== undefined
       ? { nextTurn: view.agent.inbox.nextTurn.length, nextStep: view.agent.inbox.nextStep.length }
       : foldPendingMessages(view.events);
     const waiting = this.waitingFor(sessionId, view.events);
-    const status = await this.statusOf(sessionId, view);
     const title = await this.titleOf(view);
     const span = lastTurnSpan(view.events);
     return {
@@ -980,8 +1011,8 @@ export class Bridge {
     execution?: ExecutionSupervisionView;
     history?: GoalHistoryEvent[];
   }> {
-    const view = await this.loadView(sessionId);
-    const status = await this.statusOf(sessionId, view);
+    const loaded = await this.loadView(sessionId);
+    const { view, status } = await this.recoverPersistedGoal(sessionId, loaded);
     this.releaseWorkspaceIfTerminal(sessionId, status);
     const pending = view.agent !== undefined
       ? { nextTurn: view.agent.inbox.nextTurn.length, nextStep: view.agent.inbox.nextStep.length }
@@ -1010,6 +1041,7 @@ export class Bridge {
     constraints?: GoalConstraints;
     request_id?: string;
     workspace_lock_override?: boolean;
+    agent_options?: AgentOptionsInput;
   }): Promise<GoalStartResult> {
     return this.startGoal(input);
   }
@@ -1204,10 +1236,18 @@ export class Bridge {
     constraints?: GoalConstraints;
     expected_revision?: number;
     workspace_lock_override?: boolean;
+    agent_options?: AgentOptionsInput;
   }): Promise<GoalStartResult> {
     if (input.goal.trim() === '') throw new BridgeError('EMPTY_GOAL', 'goal must not be empty');
 
-    // 1. Static Preflight Validation
+    if (input.session_id !== undefined && input.session_id.trim() !== '' && input.agent_options !== undefined) {
+      throw new BridgeError(
+        'AGENT_OPTIONS_NOT_SUPPORTED_FOR_EXISTING_SESSION',
+        `agent_options cannot be specified for existing session "${input.session_id}"; explicit agent_options are only supported when creating a new session`,
+      );
+    }
+
+    // 1. Structured preflight validation (constraint set only; never Goal text)
     const preflight = validateGoalPreflight({
       goal: input.goal,
       plan: input.plan,
@@ -1217,7 +1257,7 @@ export class Bridge {
     if (!preflight.valid) {
       throw new BridgeError(
         'GOAL_INVALID',
-        `Goal contradicts constraints: ${preflight.conflicts.join('; ')}`,
+        `Contradictory structured constraints: ${preflight.conflicts.join('; ')}`,
       );
     }
 
@@ -1258,6 +1298,15 @@ export class Bridge {
           const status = await this.statusOf(agent.id, view);
           if (!isActiveStatus(status) && !isWaitingStatus(status)) continue;
           if (isGoalSemanticallyEqual(record, input.goal, input.plan, input.execution_mode, input.constraints)) {
+            if (input.agent_options !== undefined) {
+              if (record.agent_options === undefined || !isAgentOptionsEqual(record.agent_options, input.agent_options)) {
+                continue;
+              }
+            } else {
+              if (record.agent_options !== undefined) {
+                continue;
+              }
+            }
             reusedSessionId = agent.id;
             break;
           }
@@ -1276,7 +1325,7 @@ export class Bridge {
       }
 
       this.assertMutableWorkspaceAvailable(workspacePath, undefined, lockOverride, isReadOnly);
-      const created = await this.createSession(input.workspace, titleFromGoal(input.goal));
+      const created = await this.createSession(input.workspace, titleFromGoal(input.goal), undefined, input.agent_options);
       sessionId = created.session_id;
     } else {
       this.adopt(sessionId);
@@ -1395,7 +1444,7 @@ export class Bridge {
     const resolvedResume = input.resume_steps === undefined
       ? { ids: action === 'resume' ? [...(current?.deferred_step_ids ?? [])] : [], kinds: [] as ActionKind[] }
       : resolveStepRefs(input.resume_steps, observed.graph.steps);
-    const detected = detectDeferredKinds(input.goal ?? current?.goal ?? '', input.plan ?? current?.plan);
+    const detected = detectDeferredKinds(input.plan ?? current?.plan);
     const deferIds = uniqueStrings([
       ...resolvedDefer.ids,
       ...resolvedDefer.kinds,
@@ -1468,7 +1517,7 @@ export class Bridge {
     cleanup_warning?: string;
   }> {
     this.adopt(sessionId);
-    this.workspaceGuard.releaseLock(sessionId);
+    this.releaseWorkspaceLock(sessionId);
     const view = await this.loadView(sessionId);
     const status = await this.statusOf(sessionId, view);
     if (isTerminalStatus(status) || status === 'unknown' || (status === 'idle' && view.agent === undefined)) {
@@ -1541,11 +1590,12 @@ export class Bridge {
     execution_mode?: ExecutionMode;
     constraints?: GoalConstraints;
     expected_revision?: number;
+    agent_options?: AgentOptionsInput;
   }): GoalRecord {
     const existing = this.goalStore.get(sessionId);
     const mode = parseExecutionMode(input.execution_mode);
     const constraints = parseConstraints(input.constraints);
-    const detected = detectDeferredKinds(input.goal, input.plan);
+    const detected = detectDeferredKinds(input.plan);
     if (existing === undefined) {
       const created = createGoalRecord({
         sessionId,
@@ -1555,6 +1605,7 @@ export class Bridge {
         constraints,
         now: this.now(),
         revisionReason: 'goal_created',
+        agentOptions: input.agent_options,
       });
       if (detected.length > 0) created.deferred_step_ids = [...new Set(detected)];
       return this.goalStore.put(created);
@@ -2058,7 +2109,13 @@ export class Bridge {
     return { approval_id: approvalId, session_id: sessionId, decision, outcome, layer: 'user' };
   }
 
+  /**
+   * A lock holder is active when its agent is live and working. The direct
+   * (non-Goal) write channel publishes its own transient holder in the same
+   * guard, so a Goal starting mid-write must treat it as active too.
+   */
   private isLockHolderActive(sessionId: string): boolean {
+    if (this.directWorkspace.isDirectWriterActive(sessionId)) return true;
     const holderAgent = this.ctx.agents.get(SessionId(sessionId));
     if (holderAgent === undefined) return false;
     if (holderAgent.status === 'running') return true;
@@ -2120,8 +2177,65 @@ export class Bridge {
     }
   }
 
+  /** Idempotent: releasing a lock the session no longer holds is a no-op. */
+  private releaseWorkspaceLock(sessionId: string): void {
+    this.workspaceGuard.releaseLock(sessionId);
+  }
+
   private releaseWorkspaceIfTerminal(sessionId: string, status: BridgeStatus): void {
-    if (isTerminalStatus(status)) this.workspaceGuard.releaseLock(sessionId);
+    if (isTerminalStatus(status)) this.releaseWorkspaceLock(sessionId);
+  }
+
+  /** A supervised Goal that reached a terminal bridge event is never revived. */
+  private isSupervisedGoalEnded(record: GoalRecord): boolean {
+    return record.history.some((event) => event.type === 'goal_completed' || event.type === 'goal_cancelled');
+  }
+
+  /**
+   * Bridge/DSH reload recovery. A persisted supervised Goal whose live agent is
+   * gone folds from the session log plus the Goal sidecar; when the Goal is not
+   * bridge-terminal the agent is resumed through ensureAgent so the reported
+   * status is the live, stable one instead of a cold 'unknown'.
+   */
+  private async recoverPersistedGoal(
+    sessionId: string,
+    loaded: LoadedView,
+  ): Promise<{ view: LoadedView; status: BridgeStatus }> {
+    const status = await this.statusOf(sessionId, loaded);
+    if (loaded.agent !== undefined) return { view: loaded, status };
+    const record = this.goalStore.get(sessionId);
+    if (record === undefined || this.isSupervisedGoalEnded(record)) return { view: loaded, status };
+    try {
+      const agent = await this.ensureAgent(sessionId);
+      const view: LoadedView = {
+        agent,
+        session: agent.session,
+        events: agent.session.snapshotEvents(),
+        header: agent.session.header,
+      };
+      this.adopt(sessionId);
+      this.log.info(`recovered persisted supervised Goal ${record.goal_id} for ${sessionId}`);
+      return { view, status: await this.statusOf(sessionId, view) };
+    } catch (error) {
+      // A concurrent read may have resumed this session first (register rejects
+      // a duplicate id). Re-check before degrading the reported status.
+      const raced = this.ctx.agents.get(SessionId(sessionId));
+      if (raced !== undefined) {
+        const view: LoadedView = {
+          agent: raced,
+          session: raced.session,
+          events: raced.session.snapshotEvents(),
+          header: raced.session.header,
+        };
+        return { view, status: await this.statusOf(sessionId, view) };
+      }
+      // No live agent and resume unavailable: report a stable awaiting-resume
+      // state rather than an ambiguous 'unknown' for a persisted Goal.
+      this.log.warn(
+        `supervised Goal ${sessionId} could not be resumed on read: ${redactText(error instanceof Error ? error.message : String(error))}`,
+      );
+      return { view: loaded, status: status === 'unknown' ? 'idle' : status };
+    }
   }
 
   private skipIdempotentStep(

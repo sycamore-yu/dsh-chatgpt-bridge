@@ -1,7 +1,25 @@
 /**
  * Goal, Plan, and Constraints Preflight Validator.
- * Performs static checks before agent startup to detect contradictory goals
- * (e.g., Goal requires editing files, but constraints specify read_only).
+ *
+ * Control-plane invariant: permission, danger, lock, approval and blocking
+ * decisions are never derived from free text. The natural-language `goal` and
+ * `plan` strings are deliberately NOT parsed for "intent": a Goal that merely
+ * mentions write / delete / commit / publish words — negated ("do not modify
+ * any file"), discussed ("audit the code that handles deletes"), quoted
+ * ("the error says \"write failed\""), or referenced in Chinese
+ * ("禁止修改文件") — must never be rejected before the Agent starts.
+ *
+ * Action intent is decided at execution time from real tool calls and
+ * structured action facts:
+ *   - `evaluateConstraint` / `rejectConstraint` (goal-constraints.ts) enforce
+ *     read_only, allowed/forbidden actions and max_changed_files per call.
+ *   - `evaluateApproval` (approval-policy.ts) derives risk tier from tool name
+ *     plus tool-call arguments.
+ *   - workspace locks and drift detection use workspace state, not Goal text.
+ *
+ * This module therefore validates only the structured constraint set the
+ * caller actually sent, for self-contradictions that are decidable without
+ * reading a single word of the Goal.
  */
 import type { ExecutionMode, GoalConstraints, ActionClass } from './goal-constraints.js';
 
@@ -11,122 +29,52 @@ export interface PreflightResult {
   suggested_constraint_delta?: string[];
 }
 
-const WRITE_KEYWORDS = [
-  /\b(?:edit|modify|update|create|write|delete|patch|fix|implement|refactor)\b/i,
-  /(?:修改|编辑|更新|创建|写入|删除|修复|实现|重构)/,
-];
+/** Action classes `evaluateConstraint` actually rejects while read_only is set. */
+const READ_ONLY_WRITE_CLASSES: readonly ActionClass[] = ['filesystem.write'];
 
-const GIT_MUTATE_KEYWORDS = [
-  /\b(?:git\s+commit|git\s+push|git\s+tag|git\s+merge|git\s+reset|create\s+tag|commit\s+changes|push\s+branch)\b/i,
-  /(?:提交|推送|打标签|创建标签|创建commit)/,
-];
-
-const NPM_PUBLISH_KEYWORDS = [
-  /\b(?:npm\s+publish|publish\s+package|publish\s+to\s+npm|release\s+to\s+npm)\b/i,
-  /(?:发布到npm|npm发布|发布包)/,
-];
-
-const GITHUB_RELEASE_KEYWORDS = [
-  /\b(?:gh\s+release|github\s+release|create\s+release)\b/i,
-  /(?:创建github\s*release|发布release)/,
-];
-
-const NETWORK_KEYWORDS = [
-  /\b(?:npm\s+install|pnpm\s+install|yarn\s+add|curl|wget|download|fetch\s+remote|clone)\b/i,
-  /(?:安装依赖|下载|拉取远程)/,
-];
-
-const EXTERNAL_WRITE_KEYWORDS = [
-  /\bexternal(?:_|\s+)path\b/i,
-  /\boutside (?:the )?workspace\b/i,
-  /workspace\s*外/,
-];
-
-function hasIntent(text: string, patterns: RegExp[]): boolean {
-  return patterns.some((p) => p.test(text));
-}
-
+/**
+ * Validate the structured constraint set only.
+ *
+ * `goal` and `plan` are accepted for call-site compatibility and are
+ * intentionally never inspected. `mode` is accepted for the same reason;
+ * mode defaults are merged later by `mergeConstraints`, never here.
+ */
 export function validateGoalPreflight(input: {
   goal: string;
   plan?: string;
   constraints?: GoalConstraints;
   mode?: ExecutionMode;
 }): PreflightResult {
-  const text = `${input.goal}\n${input.plan ?? ''}`;
   const constraints = input.constraints ?? {};
   const conflicts: string[] = [];
   const suggestedDeltas: string[] = [];
 
-  const forbidden = new Set(constraints.forbidden_actions ?? []);
-  const allowed = constraints.allowed_actions !== undefined ? new Set(constraints.allowed_actions) : undefined;
+  const forbidden = new Set<ActionClass>(constraints.forbidden_actions ?? []);
+  const allowed = constraints.allowed_actions;
+  const allowedSet = allowed === undefined ? undefined : new Set<ActionClass>(allowed);
 
-  const isForbidden = (action: ActionClass): boolean => {
-    if (forbidden.has(action)) return true;
-    if (allowed !== undefined && !allowed.has(action)) return true;
-    return false;
-  };
-
-  // 1. Check Filesystem Write
-  const wantsWrite = hasIntent(text, WRITE_KEYWORDS);
-  if (wantsWrite) {
-    if (constraints.read_only === true) {
-      conflicts.push('Goal requires modifying files or workspace content, but constraints.read_only is true.');
-      suggestedDeltas.push('Set constraints.read_only=false');
-    }
-    if (isForbidden('filesystem.write')) {
-      conflicts.push('Goal requires modifying files, but action class "filesystem.write" is forbidden.');
-      suggestedDeltas.push('Remove "filesystem.write" from forbidden_actions or add to allowed_actions');
-    }
-    if (constraints.max_changed_files === 0) {
-      conflicts.push('Goal requires modifying files, but constraints.max_changed_files is 0.');
-      suggestedDeltas.push('Increase constraints.max_changed_files');
+  // 1. The same structured action class cannot be both allowed and forbidden.
+  if (allowedSet !== undefined) {
+    for (const action of constraints.forbidden_actions ?? []) {
+      if (!allowedSet.has(action)) continue;
+      conflicts.push(`Action class "${action}" is listed in both allowed_actions and forbidden_actions.`);
+      suggestedDeltas.push(`Remove "${action}" from either allowed_actions or forbidden_actions`);
     }
   }
 
-  // 2. Check Git Mutate
-  const wantsGitMutate = hasIntent(text, GIT_MUTATE_KEYWORDS);
-  if (wantsGitMutate) {
-    if (constraints.read_only === true) {
-      conflicts.push('Goal requires git commit/tag/push, but constraints.read_only is true.');
-      suggestedDeltas.push('Set constraints.read_only=false');
-    }
-    if (isForbidden('git.mutate')) {
-      conflicts.push('Goal requires git commit/tag/push, but action class "git.mutate" is forbidden.');
-      suggestedDeltas.push('Remove "git.mutate" from forbidden_actions or add to allowed_actions');
+  // 2. read_only forbids filesystem writes, so an allow-list cannot grant one.
+  if (constraints.read_only === true && allowedSet !== undefined) {
+    for (const action of READ_ONLY_WRITE_CLASSES) {
+      if (!allowedSet.has(action)) continue;
+      conflicts.push(`constraints.read_only is true, but allowed_actions explicitly grants "${action}".`);
+      suggestedDeltas.push(`Remove "${action}" from allowed_actions or set constraints.read_only=false`);
     }
   }
 
-  // 3. Check NPM Publish
-  const wantsNpmPublish = hasIntent(text, NPM_PUBLISH_KEYWORDS);
-  if (wantsNpmPublish) {
-    if (isForbidden('npm.publish')) {
-      conflicts.push('Goal requires publishing to npm, but action class "npm.publish" is forbidden.');
-      suggestedDeltas.push('Remove "npm.publish" from forbidden_actions or add to allowed_actions');
-    }
-  }
-
-  // 4. Check GitHub Release
-  const wantsGhRelease = hasIntent(text, GITHUB_RELEASE_KEYWORDS);
-  if (wantsGhRelease) {
-    if (isForbidden('github.release')) {
-      conflicts.push('Goal requires creating a GitHub Release, but action class "github.release" is forbidden.');
-      suggestedDeltas.push('Remove "github.release" from forbidden_actions or add to allowed_actions');
-    }
-  }
-
-  // 5. Check Network
-  const wantsNetwork = hasIntent(text, NETWORK_KEYWORDS);
-  if (wantsNetwork) {
-    if (isForbidden('network')) {
-      conflicts.push('Goal requires downloading packages or network access, but action class "network" is forbidden.');
-      suggestedDeltas.push('Remove "network" from forbidden_actions or add to allowed_actions');
-    }
-  }
-
-  // 6. Check writes outside the workspace
-  if (wantsWrite && hasIntent(text, EXTERNAL_WRITE_KEYWORDS) && isForbidden('external_path.write')) {
-    conflicts.push('Goal requires writing outside the workspace, but action class "external_path.write" is forbidden.');
-    suggestedDeltas.push('Remove "external_path.write" from forbidden_actions or add to allowed_actions');
+  // 3. A forbidden workspace scan cannot also be explicitly allowed.
+  if (constraints.allow_workspace_scan === false && allowedSet?.has('filesystem.scan') === true) {
+    conflicts.push('constraints.allow_workspace_scan is false, but allowed_actions explicitly grants "filesystem.scan".');
+    suggestedDeltas.push('Remove "filesystem.scan" from allowed_actions or set constraints.allow_workspace_scan=true');
   }
 
   return {

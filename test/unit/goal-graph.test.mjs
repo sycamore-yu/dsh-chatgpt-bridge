@@ -80,9 +80,25 @@ test('blocked without remaining steps stays terminal', () => {
   assert.equal(out.terminal, true);
 });
 
-test('detectDeferredKinds reads defer npm from a re-armed goal', () => {
-  const kinds = detectDeferredKinds('defer npm publish, continue GitHub Release');
+test('detectDeferredKinds reads the explicit [deferred] Plan marker', () => {
+  const kinds = detectDeferredKinds('- GitHub Release\n- [deferred] npm publish');
   assert.deepEqual(kinds, ['npm_publish']);
+});
+
+test('detectDeferredKinds ignores deferral wording in free text', () => {
+  // A resume instruction, a discussion, a prohibition and a negation must all
+  // stay inert: deferral is a structured request, not a word in the Goal text.
+  assert.deepEqual(detectDeferredKinds(), []);
+  assert.deepEqual(detectDeferredKinds('1. echo step A\n2. npm publish\n3. GitHub Release'), []);
+  for (const text of [
+    'Resume the deferred npm step as a no-op. Do not run npm publish.',
+    'We discussed whether to defer the npm publish in the retro.',
+    'Do not defer npm publish; ship it now.',
+    '无需延迟 npm publish，直接发布。',
+    'defer npm publish, continue GitHub Release',
+  ]) {
+    assert.deepEqual(detectDeferredKinds(text), [], text);
+  }
 });
 
 test('Test 7 — tag completed + npm blocked leaves GitHub Release runnable', () => {

@@ -26,8 +26,18 @@ export interface BlockedInfo {
     independent_steps_available: boolean;
 }
 export declare function parsePlanLines(plan: string): string[];
-/** Kinds the user asked to defer when re-arming start_goal. */
-export declare function detectDeferredKinds(goal: string, plan?: string): ActionKind[];
+/**
+ * Kinds the user asked to defer, taken only from structured signals:
+ * a `[deferred]` marker on an explicit Plan line, or the structured
+ * `defer_steps` refs resolved by the caller.
+ *
+ * Free text is never scanned for "defer ..." wording. Natural language that
+ * merely mentions deferral must not silently withhold a step — a resume
+ * message like "Resume the deferred npm step" or a discussion like
+ * "we discussed whether to defer npm publish" or a prohibition like
+ * "do not defer npm publish" is not a deferral request.
+ */
+export declare function detectDeferredKinds(plan?: string): ActionKind[];
 export interface GraphInput {
     todos?: ReconcileTodo[];
     plan?: string;

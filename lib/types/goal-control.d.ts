@@ -30,6 +30,12 @@ export interface BlockedStepRecord {
     seq: number;
     superseded?: boolean;
 }
+export interface AgentOptionsInput {
+    provider: string;
+    model: string;
+    reasoning_effort?: string;
+}
+export declare function isAgentOptionsEqual(a: AgentOptionsInput | undefined, b: AgentOptionsInput | undefined): boolean;
 export interface GoalRecord {
     goal_id: string;
     session_id: string;
@@ -48,6 +54,7 @@ export interface GoalRecord {
     superseded_step_ids?: string[];
     history: GoalHistoryEvent[];
     history_seq: number;
+    agent_options?: AgentOptionsInput;
 }
 /** Compact revision row for folded UI / wire payloads. No goal/plan text. */
 export interface FoldedRevision {
@@ -74,6 +81,7 @@ export interface CreateGoalInput {
     constraints?: GoalConstraints;
     now?: number;
     revisionReason?: string;
+    agentOptions?: AgentOptionsInput;
 }
 export interface ReviseGoalInput {
     goal?: string;

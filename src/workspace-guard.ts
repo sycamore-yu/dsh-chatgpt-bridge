@@ -37,6 +37,37 @@ export interface MutationRecord {
   timestamp: number;
 }
 
+export interface BaselineCaptureOptions {
+  /**
+   * Workspace-relative paths this caller owns. Changes to exactly these paths
+   * are removed from the fingerprint, so a direct write can prove that nothing
+   * else changed while it was in flight. Exclusion is exact-path only; a
+   * directory prefix must be listed explicitly.
+   */
+  excludePaths?: string[];
+}
+
+function normalizeExcludePaths(paths: string[] | undefined): string[] {
+  if (paths === undefined || paths.length === 0) return [];
+  const seen = new Set<string>();
+  for (const item of paths) {
+    const normalized = item.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    if (normalized !== '') seen.add(normalized);
+  }
+  return [...seen];
+}
+
+/** `XY <path>` (or `R  <old> -> <new>`) porcelain path extraction. */
+function porcelainPath(line: string): string {
+  const arrow = line.indexOf(' -> ');
+  const raw = arrow < 0 ? line.slice(3) : line.slice(arrow + 4);
+  return unquoteGitPath(raw);
+}
+
+function unquoteGitPath(raw: string): string {
+  return raw.replace(/^"|"$/g, '').replace(/\\(.)/g, '$1');
+}
+
 export class WorkspaceConcurrencyGuard {
   private readonly locks = new Map<string, WorkspaceLockHolder>(); // normalizedPath -> lock
   private readonly sessionLocks = new Map<string, string>(); // sessionId -> normalizedPath
@@ -114,8 +145,26 @@ export class WorkspaceConcurrencyGuard {
   }
 
   /** Capture baseline git HEAD SHA and dirty file status at Goal start. */
-  async captureBaseline(workspacePath: string): Promise<WorkspaceBaseline> {
+  async captureBaseline(workspacePath: string, options?: BaselineCaptureOptions): Promise<WorkspaceBaseline> {
     const normalized = normalizePath(workspacePath);
+    const excludePaths = normalizeExcludePaths(options?.excludePaths);
+    const excluded = new Set(excludePaths);
+    // `git status` reports repository-root-relative paths while `git diff` and
+    // `git ls-files` pathspecs are cwd-relative. Map the caller's
+    // workspace-relative excludes onto both spellings.
+    let statusPrefix = '';
+    if (excludePaths.length > 0) {
+      try {
+        const { stdout } = await execFileAsync('git', ['rev-parse', '--show-prefix'], {
+          cwd: normalized,
+          timeout: 5000,
+        });
+        statusPrefix = stdout.trim();
+      } catch {
+        statusPrefix = '';
+      }
+    }
+    const statusExcluded = new Set(excludePaths.map((item) => `${statusPrefix}${item}`));
     let headSha: string | undefined;
     let dirtyFiles: string[] = [];
     let statusRaw = '';
@@ -139,17 +188,24 @@ export class WorkspaceConcurrencyGuard {
         timeout: 5000,
         maxBuffer: 32 * 1024 * 1024,
       });
-      statusRaw = statusOut;
-      dirtyFiles = statusOut
+      const kept = statusOut
         .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
+        .map((line) => line.replace(/\r$/, ''))
+        .filter((line) => line.trim().length > 0)
+        .filter((line) => statusExcluded.size === 0 || !statusExcluded.has(porcelainPath(line)));
+      statusRaw = kept.join('\n');
+      dirtyFiles = kept.map((line) => line.trim());
     } catch {
       // ignore
     }
 
+    const diffArgs = ['diff', '--no-ext-diff', '--binary', '--'];
+    if (excludePaths.length > 0) {
+      diffArgs.push(...excludePaths.map((item) => `:(exclude,literal)${item}`));
+    }
+
     try {
-      const { stdout } = await execFileAsync('git', ['diff', '--no-ext-diff', '--binary', '--'], {
+      const { stdout } = await execFileAsync('git', diffArgs, {
         cwd: normalized,
         timeout: 10000,
         maxBuffer: 32 * 1024 * 1024,
@@ -159,8 +215,10 @@ export class WorkspaceConcurrencyGuard {
       // Status still provides a conservative fallback fingerprint.
     }
 
+    const stagedArgs = [...diffArgs];
+    stagedArgs.splice(1, 0, '--cached');
     try {
-      const { stdout } = await execFileAsync('git', ['diff', '--cached', '--no-ext-diff', '--binary', '--'], {
+      const { stdout } = await execFileAsync('git', stagedArgs, {
         cwd: normalized,
         timeout: 10000,
         maxBuffer: 32 * 1024 * 1024,
@@ -170,13 +228,21 @@ export class WorkspaceConcurrencyGuard {
       // Status still provides a conservative fallback fingerprint.
     }
 
+    const lsFilesArgs = ['ls-files', '--others', '--exclude-standard', '-z'];
+    if (excludePaths.length > 0) {
+      lsFilesArgs.push('--', ...excludePaths.map((item) => `:(exclude,literal)${item}`));
+    }
     try {
-      const { stdout } = await execFileAsync('git', ['ls-files', '--others', '--exclude-standard', '-z'], {
+      const { stdout } = await execFileAsync('git', lsFilesArgs, {
         cwd: normalized,
         timeout: 5000,
         maxBuffer: 8 * 1024 * 1024,
       });
-      const untracked = stdout.split('\0').filter((item) => item !== '').sort();
+      const untracked = stdout
+        .split('\0')
+        .filter((item) => item !== '')
+        .filter((item) => !excluded.has(item))
+        .sort();
       untrackedMetadata = await Promise.all(untracked.map(async (relativePath) => {
         try {
           const info = await stat(join(normalized, relativePath));

@@ -67,6 +67,25 @@ export interface BlockedStepRecord {
   superseded?: boolean;
 }
 
+export interface AgentOptionsInput {
+  provider: string;
+  model: string;
+  reasoning_effort?: string;
+}
+
+export function isAgentOptionsEqual(
+  a: AgentOptionsInput | undefined,
+  b: AgentOptionsInput | undefined,
+): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  return (
+    a.provider === b.provider &&
+    a.model === b.model &&
+    (a.reasoning_effort ?? undefined) === (b.reasoning_effort ?? undefined)
+  );
+}
+
 export interface GoalRecord {
   goal_id: string;
   session_id: string;
@@ -85,6 +104,7 @@ export interface GoalRecord {
   superseded_step_ids?: string[];
   history: GoalHistoryEvent[];
   history_seq: number;
+  agent_options?: AgentOptionsInput;
 }
 
 /** Compact revision row for folded UI / wire payloads. No goal/plan text. */
@@ -114,6 +134,7 @@ export interface CreateGoalInput {
   constraints?: GoalConstraints;
   now?: number;
   revisionReason?: string;
+  agentOptions?: AgentOptionsInput;
 }
 
 export interface ReviseGoalInput {
@@ -229,6 +250,7 @@ export function createGoalRecord(input: CreateGoalInput): GoalRecord {
     superseded_step_ids: [],
     history: [],
     history_seq: 0,
+    ...(input.agentOptions !== undefined ? { agent_options: input.agentOptions } : {}),
   };
   record.revisions.push(snapshotOf(record, reason, at));
   pushHistory(record, 'goal_created', at, { metadata: { reason, mode } });
@@ -394,6 +416,16 @@ export function parseGoalRecord(raw: string): GoalRecord | undefined {
     const completed = Array.isArray(rec.completed_action_kinds)
       ? rec.completed_action_kinds.filter((item): item is ActionKind => typeof item === 'string')
       : [];
+    const rawOpts = rec.agent_options;
+    const agentOptions = rawOpts !== null && typeof rawOpts === 'object' && !Array.isArray(rawOpts)
+      ? {
+          provider: String((rawOpts as Record<string, unknown>).provider ?? ''),
+          model: String((rawOpts as Record<string, unknown>).model ?? ''),
+          ...((rawOpts as Record<string, unknown>).reasoning_effort !== undefined
+            ? { reasoning_effort: String((rawOpts as Record<string, unknown>).reasoning_effort) }
+            : {}),
+        }
+      : undefined;
     return {
       goal_id: rec.goal_id,
       session_id: rec.session_id,
@@ -410,6 +442,9 @@ export function parseGoalRecord(raw: string): GoalRecord | undefined {
       completed_action_kinds: completed,
       history,
       history_seq: typeof rec.history_seq === 'number' ? rec.history_seq : history.at(-1)?.seq ?? 0,
+      ...(agentOptions !== undefined && agentOptions.provider !== '' && agentOptions.model !== ''
+        ? { agent_options: agentOptions }
+        : {}),
     };
   } catch {
     return undefined;

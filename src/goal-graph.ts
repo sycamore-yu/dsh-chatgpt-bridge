@@ -48,25 +48,19 @@ export function parsePlanLines(plan: string): string[] {
     .filter((line) => line !== '');
 }
 
-const DEFER_TARGET = /\bdefer(?:red)?\s+(?:the\s+)?(npm(?:\s+publish)?|publish|github\s+release|gh\s+release|tag|push)\b/gi;
-
-function kindFromDeferTarget(target: string): ActionKind | undefined {
-  const text = target.toLowerCase();
-  if (text.startsWith('npm') || text === 'publish') return 'npm_publish';
-  if (text.includes('release')) return 'github_release';
-  if (text === 'tag') return 'git_tag';
-  if (text === 'push') return 'git_push';
-  return undefined;
-}
-
-/** Kinds the user asked to defer when re-arming start_goal. */
-export function detectDeferredKinds(goal: string, plan?: string): ActionKind[] {
-  const text = `${goal}\n${plan ?? ''}`;
+/**
+ * Kinds the user asked to defer, taken only from structured signals:
+ * a `[deferred]` marker on an explicit Plan line, or the structured
+ * `defer_steps` refs resolved by the caller.
+ *
+ * Free text is never scanned for "defer ..." wording. Natural language that
+ * merely mentions deferral must not silently withhold a step — a resume
+ * message like "Resume the deferred npm step" or a discussion like
+ * "we discussed whether to defer npm publish" or a prohibition like
+ * "do not defer npm publish" is not a deferral request.
+ */
+export function detectDeferredKinds(plan?: string): ActionKind[] {
   const kinds = new Set<ActionKind>();
-  for (const match of text.matchAll(DEFER_TARGET)) {
-    const kind = kindFromDeferTarget(match[1] ?? '');
-    if (kind !== undefined) kinds.add(kind);
-  }
   for (const line of parsePlanLines(plan ?? '')) {
     if (!/\[deferred\]/i.test(line)) continue;
     const kind = classifyTodoKind(line.replace(/\[deferred\]/ig, ''));

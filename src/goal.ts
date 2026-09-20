@@ -170,6 +170,7 @@ export function fingerprintStart(input: {
   execution_mode?: string;
   constraints?: unknown;
   action?: string;
+  agent_options?: unknown;
 }): string {
   return JSON.stringify({
     workspace: input.workspace,
@@ -179,6 +180,7 @@ export function fingerprintStart(input: {
     execution_mode: input.execution_mode ?? '',
     constraints: input.constraints ?? null,
     action: input.action ?? '',
+    agent_options: input.agent_options ?? null,
   });
 }
 

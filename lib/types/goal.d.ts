@@ -49,6 +49,7 @@ export declare function fingerprintStart(input: {
     execution_mode?: string;
     constraints?: unknown;
     action?: string;
+    agent_options?: unknown;
 }): string;
 /** Only these statuses keep the Goal wait loop alive. Never treat idle as running. */
 export declare function isActiveStatus(status: BridgeStatus): boolean;
